@@ -462,6 +462,120 @@ def load_ranking_best_per_player():
     return sorted(best.items(), key=lambda kv: -kv[1])
 
 
+# ------------------------------------------------------------------
+# Firebase Realtime Database と同期して、端末をまたいでランキングを共有する。
+#
+# FIREBASE_DB_URL が空のうちは今まで通りlocalStorage/ファイルだけで動く
+# （何も壊れない）。URLを設定すると、ランキングの取得・送信を
+# Firebase Realtime Databaseに対しても行うようになる。
+#
+# データの持ち方はシンプルに { "プレイヤー名": スコア, ... } という
+# 1つのJSONオブジェクト（ノード名 "ranking"）。
+# ------------------------------------------------------------------
+FIREBASE_DB_URL = "https://englisheiken-kazux68k-default-rtdb.firebaseio.com/"  # ← ここにご自身のURLを入れてください（末尾の / は不要）
+# 例: FIREBASE_DB_URL = "https://englishword-ranking-default-rtdb.firebasedatabase.app"
+
+try:
+    import pyodide.http as _pyodide_http
+    HAS_PYODIDE_HTTP = True
+except Exception:
+    _pyodide_http = None
+    HAS_PYODIDE_HTTP = False
+
+import asyncio
+
+# フェッチ結果を非同期タスクからメインループへ橋渡しするための箱
+_firebase_ranking_result = {"data": None, "pending": False}
+
+
+def firebase_enabled():
+    return bool(FIREBASE_DB_URL)
+
+
+def _firebase_fetch_ranking_sync():
+    """（ローカル実行用）同期的にFirebaseからランキングを取得する。"""
+    import urllib.request
+    url = f"{FIREBASE_DB_URL}/ranking.json"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data or {}
+    except Exception as e:
+        print(f"[Firebase] ランキング取得に失敗しました: {e}")
+        return None
+
+
+def _firebase_push_ranking_sync(player, score):
+    """（ローカル実行用）同期的にFirebaseへスコアを1件送信する。"""
+    import urllib.request
+    import urllib.parse
+    url = f"{FIREBASE_DB_URL}/ranking/{urllib.parse.quote(player, safe='')}.json"
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(score).encode("utf-8"), method="PUT",
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as e:
+        print(f"[Firebase] ランキング送信に失敗しました: {e}")
+
+
+async def _firebase_fetch_ranking_task():
+    try:
+        resp = await _pyodide_http.pyfetch(f"{FIREBASE_DB_URL}/ranking.json")
+        data = await resp.json()
+        _firebase_ranking_result["data"] = data or {}
+    except Exception as e:
+        print(f"[Firebase] ランキング取得に失敗しました: {e}")
+        _firebase_ranking_result["data"] = {}
+    finally:
+        _firebase_ranking_result["pending"] = False
+
+
+async def _firebase_push_ranking_task(player, score):
+    import urllib.parse
+    try:
+        await _pyodide_http.pyfetch(
+            f"{FIREBASE_DB_URL}/ranking/{urllib.parse.quote(player, safe='')}.json",
+            method="PUT",
+            body=json.dumps(score),
+            headers={"Content-Type": "application/json"},
+        )
+    except Exception as e:
+        print(f"[Firebase] ランキング送信に失敗しました: {e}")
+
+
+def firebase_fetch_ranking_start():
+    """Firebaseからランキングを取り始める（結果はすぐには返らない）。
+    Web版は非同期で裏で取得し、_firebase_ranking_result に後から入る。
+    ローカル版はその場で取得して即座に入れる。"""
+    if not firebase_enabled():
+        return
+    if HAS_PYODIDE_HTTP:
+        _firebase_ranking_result["pending"] = True
+        asyncio.ensure_future(_firebase_fetch_ranking_task())
+    else:
+        _firebase_ranking_result["data"] = _firebase_fetch_ranking_sync()
+
+
+def firebase_push_ranking(player, score):
+    """Firebaseへスコアを1件送信する（失敗しても呼び出し側は気にしなくてよい）。"""
+    if not firebase_enabled():
+        return
+    if HAS_PYODIDE_HTTP:
+        asyncio.ensure_future(_firebase_push_ranking_task(player, score))
+    else:
+        _firebase_push_ranking_sync(player, score)
+
+
+def firebase_take_ranking_result():
+    """firebase_fetch_ranking_start() の結果が届いていれば取り出す（無ければNone）。
+    一度取り出したらクリアする。"""
+    data = _firebase_ranking_result["data"]
+    _firebase_ranking_result["data"] = None
+    return data
+
+
 # --- 例文中の対象単語を隠す ---
 def mask_target_word(sentence, english):
     if not sentence:
@@ -745,6 +859,22 @@ class WordGame:
 
     def refresh_best_scores(self):
         self.cached_best_scores = dict(load_ranking_best_per_player())
+        firebase_fetch_ranking_start()  # 結果が届いたらupdate()の中で反映される
+
+    def merge_cloud_ranking_if_ready(self):
+        """Firebaseからの取得結果が届いていたら、ローカルのキャッシュ・保存データに
+        取り込む（値が大きい方を残す）。届いていなければ何もしない。"""
+        cloud = firebase_take_ranking_result()
+        if not cloud:
+            return
+        for player, score in cloud.items():
+            try:
+                score = int(score)
+            except (TypeError, ValueError):
+                continue
+            if player not in self.cached_best_scores or score > self.cached_best_scores[player]:
+                self.cached_best_scores[player] = score
+                save_ranking_entry(player, score)  # ローカルにも反映しておく
 
     def go_to_start(self):
         self.refresh_missed_count()
@@ -915,6 +1045,13 @@ class WordGame:
         save_ranking_entry(self.player, final_score)
         self.ranking_rows = load_ranking_best_per_player()[:5]
 
+        if self.ta_is_new_best:
+            # 自己ベスト更新時だけFirebaseにも送る
+            # （クラウド側の値がローカルより新しい可能性も考え、より高い方を送る）
+            best_known = max(final_score, self.cached_best_scores.get(self.player, final_score))
+            firebase_push_ranking(self.player, best_known)
+            self.cached_best_scores[self.player] = best_known
+
         self.state = STATE_RESULT
 
     def update_result(self):
@@ -954,6 +1091,7 @@ class WordGame:
                 self.notice = ""
 
         if self.state == STATE_PLAYER_SELECT:
+            self.merge_cloud_ranking_if_ready()
             self.update_player_select()
             return
 
